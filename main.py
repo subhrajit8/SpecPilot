@@ -1,8 +1,11 @@
 import io                                   # in-memory byte streams (to read uploaded PDFs)
 import os                                   # read environment variables
+from uuid import uuid4                      # generate opaque server-side session ids
 from contextlib import asynccontextmanager  # lets us define startup/shutdown logic for the app
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage          # wraps the user's text as a chat message
 from langgraph.checkpoint.memory import MemorySaver       # in-memory history (dev only)
 from pydantic import BaseModel                            # request-body validation
@@ -47,6 +50,62 @@ def thread_config(user_id: str, session_id: str) -> dict:
     return {"configurable": {"thread_id": f"{user_id}:{session_id}"}}
 
 
+@app.post("/threads", status_code=201)
+async def create_thread(user_id: str = Depends(current_user)):
+    """Create a new chat thread id on the backend."""
+    thread_id = str(uuid4())
+    await app.state.graph.aupdate_state(
+        thread_config(user_id, thread_id),
+        {"mode": "chat"},
+    )
+    return {"thread_id": thread_id, "session_id": thread_id}
+
+
+@app.get("/threads")
+async def list_threads(user_id: str = Depends(current_user)):
+    """List saved chat threads belonging to the authenticated user."""
+    thread_prefix = f"{user_id}:"
+    latest_by_thread = {}
+
+    async for checkpoint_tuple in app.state.graph.checkpointer.alist(None):
+        configurable = checkpoint_tuple.config.get("configurable", {})
+        graph_thread_id = configurable.get("thread_id", "")
+        if not graph_thread_id.startswith(thread_prefix):
+            continue
+
+        checkpoint = checkpoint_tuple.checkpoint
+        timestamp = checkpoint.get("ts")
+        previous = latest_by_thread.get(graph_thread_id)
+        if previous is None or (timestamp or "") > (previous["timestamp"] or ""):
+            latest_by_thread[graph_thread_id] = {
+                "timestamp": timestamp,
+                "channel_values": checkpoint.get("channel_values", {}),
+            }
+
+    threads = []
+    for graph_thread_id, saved in latest_by_thread.items():
+        messages = saved["channel_values"].get("messages", [])
+        first_user_message = next(
+            (message for message in messages if message.type == "human"),
+            None,
+        )
+        last_message = messages[-1] if messages else None
+        title = first_user_message.content if first_user_message else "New chat"
+        if not isinstance(title, str):
+            title = str(title)
+
+        threads.append({
+            "thread_id": graph_thread_id[len(thread_prefix):],
+            "session_id": graph_thread_id[len(thread_prefix):],
+            "title": title[:120],
+            "last_message": last_message.content if last_message else None,
+            "updated_at": saved["timestamp"],
+        })
+
+    threads.sort(key=lambda thread: thread["updated_at"] or "", reverse=True)
+    return {"threads": threads}
+
+
 def extract_text(filename: str, data: bytes) -> str:
     """CPU-bound parsing: turn raw file bytes into text (PDF, or plain txt/md)."""
     if filename.lower().endswith(".pdf"):
@@ -69,7 +128,7 @@ async def read_file(f: UploadFile) -> str:
 
 @app.post("/generate")
 async def generate(
-    session_id: str = Form(...),                                       # The frontend creates the session_id itself when you click New session
+    session_id: str = Form(...),                                       # Use the id returned by POST /threads
     instructions: str = Form("Generate the PRD and technical documentation."),  # optional PM notes
     compliance_pdf: UploadFile = File(...),                            # compliance guidelines file
     requirements_doc: UploadFile = File(...),                          # client requirements file
@@ -109,12 +168,31 @@ async def chat(body: ChatIn, user_id: str = Depends(current_user)):
     return {"reply": result["messages"][-1].content}  # last message = the assistant's answer
 
 
-@app.get("/history/{session_id}")
-async def history(session_id: str, user_id: str = Depends(current_user)):
-    # Load the saved state for this user's thread.
-    state = await app.state.graph.aget_state(thread_config(user_id, session_id))
-    msgs = state.values.get("messages", [])           # empty list if the session doesn't exist
-    return [
-        {"role": "user" if m.type == "human" else "assistant", "content": m.content}
-        for m in msgs
-    ]
+@app.get("/threads/{thread_id}")
+async def load_thread(thread_id: str, user_id: str = Depends(current_user)):
+    """Load a user's saved conversation and generated documents by thread id."""
+    state = await app.state.graph.aget_state(thread_config(user_id, thread_id))
+    values = state.values
+    if not values:
+        raise HTTPException(404, "Thread not found")
+
+    messages = values.get("messages", [])
+    if not messages:
+        raise HTTPException(404, "Thread not found")
+
+    return {
+        "thread_id": thread_id,
+        "messages": [
+            {"role": "user" if message.type == "human" else "assistant", "content": message.content}
+            for message in messages
+        ],
+        "prd": values.get("prd"),
+        "tech_doc": values.get("tech_doc"),
+    }
+
+
+app.mount(
+    "/",
+    StaticFiles(directory=Path(__file__).parent / "frontend", html=True),
+    name="frontend",
+)
