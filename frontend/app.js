@@ -52,6 +52,61 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function streamApi(path, options = {}, onEvent = () => {}) {
+  const userId = userIdInput.value.trim();
+  if (!userId) {
+    throw new Error("Enter your user ID in the lower-left corner to connect.");
+  }
+  localStorage.setItem(USER_KEY, userId);
+
+  const headers = new Headers(options.headers || {});
+  headers.set("X-User-Id", userId);
+  headers.set("Accept", "text/event-stream");
+  const response = await fetch(path, { ...options, headers });
+  if (!response.ok) {
+    const contentType = response.headers.get("content-type") || "";
+    const payload = contentType.includes("application/json")
+      ? await response.json()
+      : await response.text();
+    const detail = typeof payload === "object" && payload !== null
+      ? payload.detail || JSON.stringify(payload)
+      : payload;
+    throw new Error(detail || `Request failed (${response.status})`);
+  }
+  if (!response.body) throw new Error("This browser does not support streamed responses.");
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let completed = null;
+
+  function dispatch(block) {
+    let event = "message";
+    const dataLines = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    }
+    if (!dataLines.length) return;
+    const data = JSON.parse(dataLines.join("\n"));
+    if (event === "error") throw new Error(data.detail || data.message || "Stream failed.");
+    if (event === "complete") completed = data;
+    onEvent(event, data);
+  }
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() || "";
+    for (const block of blocks) dispatch(block);
+    if (done) break;
+  }
+  if (buffer.trim()) dispatch(buffer);
+  if (!completed) throw new Error("The server ended the stream without a completion event.");
+  return completed;
+}
+
 function setBusy(button, busy, label) {
   button.disabled = busy;
   if (label) button.querySelector("span:first-child").textContent = label;
@@ -131,7 +186,7 @@ function resetSetupView(title = "New project") {
   canGenerate();
 }
 
-function renderDocumentView(thread, data) {
+function renderDocumentView(thread, data, progressMessage = "") {
   const panel = document.createElement("div");
   panel.className = "document-workspace";
 
@@ -146,6 +201,12 @@ function renderDocumentView(thread, data) {
   subtitle.className = "welcome-copy";
   subtitle.textContent = "Review your generated documents or ask for a focused change.";
   heading.append(kicker, title, subtitle);
+  if (progressMessage) {
+    const progress = document.createElement("p");
+    progress.className = "generation-progress";
+    progress.textContent = progressMessage;
+    heading.append(progress);
+  }
 
   const tabs = document.createElement("div");
   tabs.className = "document-tabs";
@@ -153,8 +214,8 @@ function renderDocumentView(thread, data) {
   contents.className = "document-content";
 
   const documents = [
-    ["PRD", data.prd || "No PRD is available in this thread yet."],
-    ["Technical documentation", data.tech_doc || "No technical documentation is available yet."],
+    ["PRD", data.prd || (progressMessage ? "The PRD is being prepared…" : "No PRD is available in this thread yet.")],
+    ["Technical documentation", data.tech_doc || (progressMessage ? "The technical documentation is being prepared…" : "No technical documentation is available yet.")],
     ["Conversation", null],
   ];
 
@@ -218,10 +279,12 @@ function renderConversation(container, messages) {
     submit.disabled = true;
     submit.textContent = "Thinking…";
     try {
-      await api("/chat", {
+      await streamApi("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: state.activeThreadId, message }),
+      }, (event, data) => {
+        if (event === "reply") notify("Assistant replied. Loading the updated thread…", "info");
       });
       await openThreadById(state.activeThreadId);
       await loadThreads();
@@ -304,9 +367,35 @@ generateForm.addEventListener("submit", async (event) => {
   setBusy(generateButton, true, "Generating…");
   try {
     notify("Your documents are being generated. This may take a few minutes.", "info");
-    const result = await api("/generate", { method: "POST", body: formData });
-    const refreshed = await api("/threads");
-    state.threads = Array.isArray(refreshed.threads) ? refreshed.threads : [];
+    const streamedDocuments = { prd: null, tech_doc: null, messages: [] };
+    const progressLabels = {
+      compliance_extractor: "Extracting compliance obligations…",
+      requirements_analyst: "Analyzing requirements…",
+      prd_writer: "Writing the PRD…",
+      tech_doc_writer: "Writing technical documentation…",
+    };
+    const result = await streamApi("/generate", { method: "POST", body: formData }, (event, data) => {
+      if (event === "progress") {
+        const progressMessage = progressLabels[data.node] || "Generating your documents…";
+        notify(progressMessage, "info");
+        renderDocumentView(
+          { title: "Generating documents" },
+          streamedDocuments,
+          progressMessage,
+        );
+      }
+      if (event === "document") {
+        streamedDocuments[data.type] = data.content;
+        const nextStage = data.type === "prd"
+          ? progressLabels.tech_doc_writer
+          : "Finishing your documents…";
+        renderDocumentView(
+          { title: "Generating documents" },
+          streamedDocuments,
+          nextStage,
+        );
+      }
+    });
     await openThreadById(state.activeThreadId);
     await loadThreads();
     notify(`Documents generated for thread ${result.session_id || state.activeThreadId}.`);

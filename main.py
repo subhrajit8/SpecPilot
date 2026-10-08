@@ -1,10 +1,12 @@
 import io                                   # in-memory byte streams (to read uploaded PDFs)
+import json
 import os                                   # read environment variables
 from uuid import uuid4                      # generate opaque server-side session ids
 from contextlib import asynccontextmanager  # lets us define startup/shutdown logic for the app
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import HumanMessage          # wraps the user's text as a chat message
 from langgraph.checkpoint.memory import MemorySaver       # in-memory history (dev only)
@@ -126,6 +128,11 @@ async def read_file(f: UploadFile) -> str:
     return await run_in_threadpool(extract_text, f.filename, data)
 
 
+def sse_event(event: str, data: dict) -> str:
+    """Format one Server-Sent Event."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
 @app.post("/generate")
 async def generate(
     session_id: str = Form(...),                                       # Use the id returned by POST /threads
@@ -139,17 +146,37 @@ async def generate(
     if not compliance_text.strip():                          # scanned PDFs have no text layer
         raise HTTPException(422, "No text extracted from compliance PDF (scanned? run OCR first).")
 
-    # ainvoke runs the whole graph asynchronously: every agent awaits its LLM call without blocking.
-    result = await app.state.graph.ainvoke(
-        {
-            "mode": "generate",                                   # tell the router to run the pipeline
-            "messages": [HumanMessage(content=instructions)],     # first message in this thread's history
-            "compliance_text": compliance_text,
-            "requirements_text": requirements_text,
-        },
-        config=thread_config(user_id, session_id),                # which user's thread to save into
+    async def generate_events():
+        result = {}
+        async for update in app.state.graph.astream(
+            {
+                "mode": "generate",
+                "messages": [HumanMessage(content=instructions)],
+                "compliance_text": compliance_text,
+                "requirements_text": requirements_text,
+            },
+            config=thread_config(user_id, session_id),
+            stream_mode="updates",
+        ):
+            for node, values in update.items():
+                result.update(values)
+                yield sse_event("progress", {"node": node, "status": "completed"})
+                if "prd" in values:
+                    yield sse_event("document", {"type": "prd", "content": values["prd"]})
+                if "tech_doc" in values:
+                    yield sse_event("document", {"type": "tech_doc", "content": values["tech_doc"]})
+
+        yield sse_event("complete", {
+            "session_id": session_id,
+            "prd": result["prd"],
+            "tech_doc": result["tech_doc"],
+        })
+
+    return StreamingResponse(
+        generate_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-    return {"session_id": session_id, "prd": result["prd"], "tech_doc": result["tech_doc"]}
 
 
 class ChatIn(BaseModel):
@@ -160,12 +187,23 @@ class ChatIn(BaseModel):
 
 @app.post("/chat")
 async def chat(body: ChatIn, user_id: str = Depends(current_user)):
-    # mode="chat" routes straight to the chat agent; saved PRD/tech doc/history load from the checkpoint.
-    result = await app.state.graph.ainvoke(
-        {"mode": "chat", "messages": [HumanMessage(content=body.message)]},
-        config=thread_config(user_id, body.session_id),
+    async def chat_events():
+        async for update in app.state.graph.astream(
+            {"mode": "chat", "messages": [HumanMessage(content=body.message)]},
+            config=thread_config(user_id, body.session_id),
+            stream_mode="updates",
+        ):
+            chat_update = update.get("chat_agent")
+            if chat_update and chat_update.get("messages"):
+                yield sse_event("reply", {"reply": chat_update["messages"][-1].content})
+
+        yield sse_event("complete", {"session_id": body.session_id})
+
+    return StreamingResponse(
+        chat_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-    return {"reply": result["messages"][-1].content}  # last message = the assistant's answer
 
 
 @app.get("/threads/{thread_id}")

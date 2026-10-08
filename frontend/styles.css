@@ -246,6 +246,7 @@ h2 { margin: 6px 0 0; font-family: var(--serif); font-size: 17px; font-weight: 6
 .document-workspace { width: min(100%, 900px); }
 .document-heading { margin: 5px 0 24px; }
 .document-heading h1 { margin-top: 12px; font-size: clamp(30px, 3.6vw, 42px); overflow-wrap: anywhere; }
+.generation-progress { display: inline-flex; align-items: center; margin: 12px 0 0; padding: 7px 10px; color: #477557; background: #eaf3ec; border-radius: 5px; font-size: 10px; }
 .document-tabs { display: flex; gap: 4px; padding-bottom: 0; border-bottom: 1px solid var(--line); }
 .document-tab { padding: 10px 14px; color: #818982; background: transparent; border: 0; border-bottom: 2px solid transparent; cursor: pointer; font-size: 11px; }
 .document-tab:hover { color: var(--green); }
