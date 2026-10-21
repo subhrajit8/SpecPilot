@@ -4,59 +4,11 @@ Flow:  compliance PDF + client requirements
        -> Compliance Extractor -> Requirements Analyst -> PRD Writer -> Tech Doc Writer
 The Product Manager reviews the output manually; follow-up edits/questions go through the chat agent.
 """
-import os                                              # read environment variables (model name)
-from typing import Annotated, Literal, TypedDict       # type hints for the graph state
 
-from langchain_anthropic import ChatAnthropic          # LangChain wrapper around the Claude API
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage  # chat message types
 from langgraph.graph import END, START, StateGraph     # graph builder + special start/end nodes
-from langgraph.graph.message import add_messages       # reducer: appends new messages to history
-
-# Model name comes from env var LLM_MODEL; falls back to Claude Sonnet 5.5 if not set.
-MODEL = os.getenv("LLM_MODEL", "claude-sonnet-5-5")
-
-
-def make_llm(temperature: float) -> ChatAnthropic:
-    """Create one LLM client with a given temperature (lower = more deterministic)."""
-    return ChatAnthropic(
-        model=MODEL,            # which Claude model to call
-        temperature=temperature,  # randomness of the output
-        max_tokens=8000,        # upper limit on tokens in each response
-        timeout=180,            # give up on a single API call after 180 seconds
-        max_retries=2,          # automatically retry transient API errors twice
-    )
-
-
-# One client per role, each with the temperature that suits its job.
-extractor_llm = make_llm(0.0)   # extraction must be faithful and repeatable
-analyst_llm = make_llm(0.1)     # analysis: almost deterministic, tiny flexibility
-writer_llm = make_llm(0.3)      # PRD/tech doc: natural prose, still grounded
-chat_llm = make_llm(0.3)        # follow-up conversation with the PM
-
-
-class State(TypedDict, total=False):
-    """Shared data that flows between agents. total=False means every key is optional."""
-    messages: Annotated[list, add_messages]   # chat history; add_messages appends instead of overwriting
-    mode: Literal["generate", "chat"]         # which path to run: full pipeline or just chat
-    compliance_text: str                      # text extracted from the compliance PDF
-    requirements_text: str                    # text extracted from the client requirement doc
-    obligations: str                          # output of Compliance Extractor
-    requirement_analysis: str                 # output of Requirements Analyst
-    prd: str                                  # output of PRD Writer
-    tech_doc: str                             # output of Tech Doc Writer
-
-
-async def _ask(llm: ChatAnthropic, system: str, user: str) -> str:
-    """Send one system+user prompt to the LLM and return the reply text.
-
-    async + ainvoke: while we wait for the API, the event loop is FREE to serve other
-    requests. (The old llm.invoke() blocked the whole server during the wait.)
-    """
-    response = await llm.ainvoke(                  # non-blocking call to the model
-        [SystemMessage(content=system),            # system message = the agent's role/instructions
-         HumanMessage(content=user)]               # user message = the actual input data
-    )
-    return response.content                        # the generated text
+from utils.DataModels import State                     # shared state schema
+from Models.llm_models import extractor_llm, analyst_llm, writer_llm, chat_llm, _ask  # LLM clients
 
 
 # ---------------------------------------------------------------- Agents (graph nodes)
